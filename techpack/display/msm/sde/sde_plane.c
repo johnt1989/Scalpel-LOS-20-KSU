@@ -144,8 +144,6 @@ struct sde_plane {
 	/* debugfs related stuff */
 	struct dentry *debugfs_root;
 	bool debugfs_default_scale;
-
-	u8 fod_dim_alpha;
 };
 
 #define to_sde_plane(x) container_of(x, struct sde_plane, base)
@@ -1149,7 +1147,8 @@ static inline void _sde_plane_setup_csc(struct sde_plane *psde)
 #define CSC_8BIT_LIMIT			0xff
 #define PCC_MASK			0x3ffff
 #define PCC_ONE				(1 << 15)
-#define FOD_DIM_ALPHA_MAX		255
+#define PREC_INDEX			10000
+#define PREC_DOUBLE_INDEX		100000000
 
 #define CSC_BIAS_CLAMP(value) \
 	{ 0, 0, 0 }, \
@@ -1157,11 +1156,6 @@ static inline void _sde_plane_setup_csc(struct sde_plane *psde)
 	{ 0, value, 0, value, 0, value }, \
 	{ 0, value, 0, value, 0, value }
 
-static const struct drm_msm_pcc sde_identity_pcc_cfg = {
-	.r = { .r = PCC_ONE },
-	.g = { .g = PCC_ONE },
-	.b = { .b = PCC_ONE },
-};
 static const struct sde_csc_cfg sde_identity_csc_cfg = {
 	{
 		CSC_ONE, 0, 0,
@@ -1186,47 +1180,257 @@ static const struct sde_csc_cfg sde_identity_csc_dgm_cfg = {
 	},
 };
 
-static inline s32 csc_to_signed(u32 v)
+static inline s64 csc_to_signed(u64 v)
 {
-	return sign_extend32(v, __fls(CSC_MASK));
+	return sign_extend64(v, __fls(CSC_MASK));
 }
 
-static inline u32 csc_to_unsigned(s32 v)
+static inline u64 csc_to_unsigned(s64 v)
 {
-	return ((u32) v) & CSC_MASK;
+	return ((u64) v) & CSC_MASK;
 }
 
-static inline s32 pcc_to_signed(u32 v)
+static inline s64 pcc_to_signed(u64 v)
 {
-	return sign_extend32(v, __fls(PCC_MASK));
+	return sign_extend64(v, __fls(PCC_MASK));
+}
+
+static inline u64 pcc_to_unsigned(s64 v)
+{
+	return ((u64) v) & PCC_MASK;
+}
+
+/*
+ * Checks whether the given input array has already been populated with values
+ * or is empty.
+ *
+ * input: array The input array to be checked.
+ *        size  The size of the array.
+ *
+ * returns: True if the array is empty (all elements are zero), false otherwise.
+ */
+inline bool is_array_empty(const u64 array[], size_t size)
+{
+	u8 i;
+	for (i = 0; i < size; i++) {
+		if (array[i] != 0)
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * Convert PCC coefficient values for color filters from linear to non linear.
+ *
+ * Anecdotally analizying the progression of values of PCC coefficients and their
+ * actual results in terms of graphic rendering, this equation is the closest
+ * conversion between original PCC values and actual representations of the
+ * visual changes are with those PCC transformations.
+ *
+ * The actual mathematical equation would be:
+ * y = pcc_one * ((z * (sqrt(x) / sqrt(32768))) + ((100 - z) * (x / 32768)^2)) / 100
+ * with z = 115
+ *
+ * input: pcc The current value of the PCC coefficient.
+ *
+ * returns: Non linear CSC coefficient for the PCC input value
+ */
+inline u64 pcc_nonlin_conv(u64 pcc)
+{
+	const u8 mul_const = 15;
+	const u8 div_const = 100;
+	u64 res, sqrt, pow;
+
+	sqrt = DIV_ROUND_CLOSEST_ULL(PREC_INDEX * int_sqrt(pcc * PREC_INDEX),
+						int_sqrt(PCC_ONE * PREC_INDEX));
+	pow = DIV_ROUND_CLOSEST_ULL(PREC_INDEX * pcc * pcc, PCC_ONE * PCC_ONE);
+	res = ((div_const + mul_const) * sqrt) - (mul_const * pow);
+	res = DIV_ROUND_CLOSEST_ULL(res * PCC_ONE, div_const);
+
+	return res;
+}
+
+/*
+ * Calculate the ratio between the non linear PCC conversions of two PCC
+ * coefficients, with added precision.
+ * This ratio is meant to be used as coefficient to transform the base CSC
+ * value, obtained linearly, into the CSC value with the color filter applied.
+ *
+ * input: base_pcc  The base PCC coefficient without filters applied.
+ *        new_pcc   The new PCC coefficient with filters applied.
+ *
+ * returns: The ratio between the non linear CSC calculation of new_pcc and
+ *          the one of base_pcc.
+ */
+inline u64 csc_coeff_calc(u64 base_pcc, u64 new_pcc)
+{
+	u64 csc_coeff = PREC_INDEX;
+
+	base_pcc = pcc_nonlin_conv(base_pcc);
+	new_pcc = pcc_nonlin_conv(new_pcc);
+
+	if (base_pcc > 0 && new_pcc > 0)
+		csc_coeff = DIV_ROUND_CLOSEST_ULL(new_pcc * PREC_INDEX, base_pcc);
+
+	return csc_coeff;
+}
+
+/*
+ * Rounds the input value to the target value if the absolute difference between
+ * them is within a specified percentage of the input value. The percentage
+ * is expressed in parts per thousand (‰).
+ *
+ * input: value   The value to be rounded.
+ *        target  The target value for rounding.
+ *        approx  The maximum percentage deviation allowed for rounding.
+ *
+ * returns: The rounded value, either the input value or the target value.
+ */
+inline u64 round_off_value(u64 value, u64 target, u32 approx)
+{
+	u32 approx_val = DIV_ROUND_CLOSEST_ULL(value * approx, 1000);
+
+	if (abs((s64)target - value) >= approx_val)
+		return value;
+
+	return target;
+}
+
+/*
+ * Calculate the ratio between two PCC coefficients, multiplied by
+ * PREC_DOUBLE_INDEX for better precision.
+ *
+ * input: dividend_coeff Coefficient that is used as dividend
+ *        divisor_coeff  Coefficient that is used as divisor
+ *
+ * returns: Ratio between the two coefficients, with DOUBLE_INDEX as precision.
+ */
+inline u64 pcc_coeff_ratio(u64 dividend_coeff, u64 divisor_coeff)
+{
+	dividend_coeff *= PREC_DOUBLE_INDEX;
+
+	return DIV_ROUND_CLOSEST_ULL(dividend_coeff, divisor_coeff);
+}
+
+/*
+ * Determines whether the current PCC filter represents a color filter or a
+ * color correction.
+ * Color filters and color corrections require different treatment, as the
+ * former involves modifying existing values while the latter entails
+ * introducing entirely new values.
+ *
+ * The decision is based on whether the ratio between the previous PCC
+ * coefficient and the new coefficient remains constant across the entire row
+ * of values.
+ *
+ * input: old_pcc_coeff  An array containing the previous PCC coefficients.
+ *        new_pcc_coeff  An array containing the new PCC coefficients.
+ *        i              Index used for row calculations.
+ *
+ * returns: True if the PCC change is a color filter, false otherwise.
+ */
+inline bool is_color_filter(u64 old_pcc_coeff[], u32 new_pcc_coeff[], u8 i)
+{
+	const u32 margin = 50 * PREC_INDEX;
+	u8 j;
+	u8 ii = i * 3 + i;
+	s64 mratio = pcc_coeff_ratio(new_pcc_coeff[ii], old_pcc_coeff[ii]);
+
+	for (j = 0; j < 3; j++) {
+		u8 ij = i * 3 + j;
+		u32 old_pcc_normalized, new_pcc_normalized;
+		s64 ratio = 0;
+		old_pcc_normalized = abs(pcc_to_signed(old_pcc_coeff[ij]));
+		new_pcc_normalized = abs(pcc_to_signed(new_pcc_coeff[ij]));
+
+		if (old_pcc_normalized == 0 && new_pcc_normalized == 0)
+			continue;
+
+		if (old_pcc_normalized == 0 || new_pcc_normalized == 0)
+			return false;
+
+		ratio = pcc_coeff_ratio(new_pcc_normalized, old_pcc_normalized);
+
+		if (abs(mratio - ratio) >= margin)
+			return false;
+	}
+
+	return true;
 }
 
 static inline void _sde_plane_mul_csc_pcc(struct sde_plane *psde,
 					  const struct sde_csc_cfg *csc_cfg)
 {
-	unsigned int fod_dim_scale = FOD_DIM_ALPHA_MAX - psde->fod_dim_alpha;
-	unsigned int i, j, u;
+	u8 i, j, u;
+	bool color_filter = false;
+	static u64 csc_filter_coeff[9] = { PREC_INDEX, PREC_INDEX, PREC_INDEX,
+					   PREC_INDEX, PREC_INDEX, PREC_INDEX,
+					   PREC_INDEX, PREC_INDEX, PREC_INDEX };
+	static u64 pcc_ratio[3] = { PREC_DOUBLE_INDEX, PREC_DOUBLE_INDEX, PREC_DOUBLE_INDEX };
+	static u64 old_pcc_coeff[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+	if (is_array_empty(old_pcc_coeff, 9))
+		memcpy(&old_pcc_coeff, psde->pcc_coeff, sizeof(psde->pcc_coeff));
 
 	memcpy(&psde->csc_pcc_cfg, csc_cfg, sizeof(psde->csc_pcc_cfg));
-
 	for (i = 0; i < 3; i++) {
+		u8 ii = i * 3 + i;
+		u64 pcc = psde->pcc_coeff[ii];
+		color_filter = is_color_filter(old_pcc_coeff, psde->pcc_coeff, i);
+
+		if (color_filter) {
+			pcc_ratio[i] = pcc_coeff_ratio(pcc, old_pcc_coeff[ii]);
+			csc_filter_coeff[ii] = csc_coeff_calc(old_pcc_coeff[ii], pcc);
+		}
+
 		for (j = 0; j < 3; j++) {
-			unsigned int ij = i * 3 + j;
-			s64 sum = 0;
+			bool pcc_neg = false, csc_neg = false;
+			u8 ij = i * 3 + j;
+			u64 base_pcc, csc = 0;
+			s64 csc_signed, pcc_signed, sum = 0;
+
+			pcc_signed = pcc_to_signed(psde->pcc_coeff[ij]);
+			pcc = abs(pcc_signed);
+
+			if (pcc_signed < 0)
+				pcc_neg = true;
 
 			for (u = 0; u < 3; u++) {
-				unsigned int iu = i * 3 + u;
-				unsigned int uj = u * 3 + j;
-				s64 csc = csc_to_signed(csc_cfg->csc_mv[uj]);
-				s64 pcc = pcc_to_signed(psde->pcc_coeff[iu]);
+				u8 iu = i * 3 + u;
+				u8 uj = u * 3 + j;
 
-				sum += csc * pcc;
+				pcc_signed = pcc_to_signed(psde->pcc_coeff[iu]);
+				pcc_signed = DIV_ROUND_CLOSEST(pcc_signed * PREC_DOUBLE_INDEX,
+									   (s64) pcc_ratio[i]);
+				csc_signed = csc_to_signed(csc_cfg->csc_mv[uj]);
+
+				sum += csc_signed * pcc_signed;
 			}
 
-			sum = mult_frac(sum, fod_dim_scale,
-					PCC_ONE * FOD_DIM_ALPHA_MAX);
+			if (sum < 0)
+				csc_neg = true;
 
-			psde->csc_pcc_cfg.csc_mv[ij] = csc_to_unsigned(sum);
+			csc = abs(DIV_ROUND_CLOSEST(sum, PCC_ONE));
+
+			base_pcc = DIV_ROUND_CLOSEST(pcc * PREC_DOUBLE_INDEX, pcc_ratio[i]);
+			if (color_filter) {
+				if (pcc > 0)
+					csc_filter_coeff[ij] = csc_coeff_calc(base_pcc, pcc);
+				else
+					csc_filter_coeff[ij] = csc_filter_coeff[ii];
+			} else
+				old_pcc_coeff[ij] = round_off_value(base_pcc, PCC_ONE, 2);
+
+			csc = DIV_ROUND_CLOSEST_ULL(csc * csc_filter_coeff[ij], PREC_INDEX);
+
+			if (pcc_neg)
+				old_pcc_coeff[ij] = pcc_to_unsigned(-(s64) old_pcc_coeff[ij]);
+
+			if (csc_neg)
+				csc = csc_to_unsigned(-(s64) csc);
+
+			psde->csc_pcc_cfg.csc_mv[ij] = csc;
 		}
 	}
 }
@@ -2882,11 +3086,13 @@ struct sde_csc_cfg *sde_plane_get_csc_cfg(struct drm_plane *plane)
 	struct sde_plane_state *pstate;
 	struct sde_csc_cfg *csc_ptr;
 	struct sde_plane *psde;
+	struct drm_crtc *drm_crtc = plane->state->crtc;
+	struct sde_crtc_state *cstate = to_sde_crtc_state(drm_crtc->state);
 
 	psde = to_sde_plane(plane);
 	pstate = to_sde_plane_state(plane->state);
 
-	if (sde_plane_is_fod_layer(&pstate->base))
+	if (sde_plane_is_fod_layer(&pstate->base) || cstate->color_invert_on)
 		csc_ptr = NULL;
 	else if (psde->csc_pcc_ptr)
 		csc_ptr = psde->csc_pcc_ptr;
@@ -3367,27 +3573,17 @@ static void _sde_plane_check_lut_dirty(struct sde_plane *psde,
 		SDE_EVTLOG_ERROR);
 }
 
-static inline void _sde_plane_set_fod_dim_alpha(struct sde_plane *psde,
-						struct sde_plane_state *pstate)
-{
-	if (psde->fod_dim_alpha == pstate->fod_dim_alpha)
-		return;
-
-	psde->fod_dim_alpha = pstate->fod_dim_alpha;
-
-	pstate->dirty |= SDE_PLANE_DIRTY_RECTS;
-}
-
 static inline void _sde_plane_set_csc_pcc(struct sde_plane *psde,
 					  struct sde_plane_state *pstate,
 					  struct drm_crtc *crtc)
 {
 	const struct drm_msm_pcc *pcc_cfg = sde_cp_crtc_get_pcc_cfg(crtc);
-
-	if (!pcc_cfg && psde->fod_dim_alpha)
-		pcc_cfg = &sde_identity_pcc_cfg;
+	struct sde_crtc_state *cstate = to_sde_crtc_state(crtc->state);
 
 	if (pcc_cfg == psde->pcc_cfg)
+		return;
+
+	if (cstate->color_invert_on)
 		return;
 
 	psde->pcc_cfg = pcc_cfg;
@@ -3496,7 +3692,6 @@ static int sde_plane_sspp_atomic_update(struct drm_plane *plane,
 	_sde_plane_sspp_atomic_check_mode_changed(psde, state,
 								old_state);
 
-	_sde_plane_set_fod_dim_alpha(psde, pstate);
 	_sde_plane_set_csc_pcc(psde, pstate, crtc);
 
 	/* re-program the output rects always if partial update roi changed */
@@ -3564,11 +3759,6 @@ int sde_plane_is_fod_layer(const struct drm_plane_state *drm_state)
 	pstate = to_sde_plane_state(drm_state);
 
 	return sde_plane_get_property(pstate, PLANE_PROP_FOD);
-}
-
-void sde_plane_set_fod_dim_alpha(struct sde_plane_state *pstate, u8 alpha)
-{
-	pstate->fod_dim_alpha = alpha;
 }
 
 static void sde_plane_atomic_update(struct drm_plane *plane,
